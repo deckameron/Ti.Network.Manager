@@ -8,6 +8,23 @@ Ti.Network.Manager is a comprehensive networking solution that extends Titanium'
 
 ---
 
+## Features
+
+Ti.Network.Manager provides everything missing from Titanium's built-in HTTP client:
+
+1. **Streaming Responses (SSE)** - Real-time AI responses like ChatGPT
+2. **Certificate Pinning** - Prevent man-in-the-middle attacks
+3. **Request/Response Interceptors** - Global middleware for auth, logging
+4. **Automatic Retry with Backoff** - Handle flaky networks intelligently
+5. **Advanced Caching** - Multiple strategies (cache-first, network-first)
+6. **Background Transfers** - Downloads that continue when app is backgrounded
+7. **Request Prioritization** - QoS levels for critical vs. background requests
+8. **Multipart Upload Progress** - Real-time upload progress tracking
+9. **HTTP/2 & HTTP/3** - Automatic protocol negotiation for better performance
+10. **WebSocket Support** - Bidirectional real-time communication
+
+---
+
 ## Table of Contents
 
 - [Installation](#installation)
