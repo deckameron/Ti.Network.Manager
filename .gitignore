@@ -4,7 +4,6 @@
 /*.zip
 modules/
 platform/
-README.md
 
 # Xcode/iOS specific ignores
 # Ignore user-specific project settings
