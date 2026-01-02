@@ -8,6 +8,13 @@ Ti.Network.Manager is a comprehensive networking solution that extends Titanium'
 
 ---
 
+### Roadmap
+
+- [x] v1.0: Core 10 features for iOS
+- [ ] v2.0: Android support
+- [ ] v2.1: Upload/download queuing system
+
+
 ## Features
 
 Ti.Network.Manager provides everything missing from Titanium's built-in HTTP client:
