@@ -1,0 +1,19 @@
+#
+# this is your module manifest and used by Titanium
+# during compilation, packaging, distribution, etc.
+#
+version: 1.0.0
+apiversion: 2
+architectures: arm64 x86_64
+mac: false
+description: Ti.Network.Manager
+author: Douglas Alves
+license: Specify your license
+copyright: Copyright (c) 2026 by Upflix
+
+# these should not be edited
+name: Ti.Network.Manager
+moduleid: ti.network.manager
+guid: 1511f0c0-39bd-4b7a-b84e-b272f11a3f83
+platform: iphone
+minsdk: 13.0.1.GA
