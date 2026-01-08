@@ -108,7 +108,7 @@ class TNMLogger {
             }
         }
         
-        print(logMessage)
+        NSLog("%@", logMessage)
     }
     
     // MARK: - Helpers
