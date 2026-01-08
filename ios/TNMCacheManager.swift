@@ -12,31 +12,32 @@
  * Supports: cache-first, network-first, network-only policies
  */
 
+
 import Foundation
+import CommonCrypto
 
 class TNMCacheManager {
     
     // MARK: - Properties
     
-    private let memoryCache = NSCache<NSString, CacheEntry>()
+    private var memoryCache: [String: CacheEntry] = [:]
+    private let cacheLock = NSLock()
+    private var memoryCacheSize: Int = 0
+    private let maxMemoryCacheSize = 50 * 1024 * 1024 // 50 MB
+    private let maxMemoryCacheCount = 100
+    
     private let diskCachePath: URL
     private let fileManager = FileManager.default
     
     // MARK: - Initialization
     
     init() {
-        // Setup disk cache directory
         let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         diskCachePath = cachesDir.appendingPathComponent("TNMCache")
         
-        // Create directory if needed
         if !fileManager.fileExists(atPath: diskCachePath.path) {
             try? fileManager.createDirectory(at: diskCachePath, withIntermediateDirectories: true)
         }
-        
-        // Configure memory cache
-        memoryCache.countLimit = 100
-        memoryCache.totalCostLimit = 50 * 1024 * 1024 // 50 MB
         
         TNMLogger.info("Cache manager initialized", feature: "Cache", details: [
             "diskPath": diskCachePath.path,
@@ -46,43 +47,46 @@ class TNMCacheManager {
     
     // MARK: - Public Methods
     
-    /**
-     * Get cached response
-     */
     func getCachedResponse(
         for key: String,
         maxAge: TimeInterval?
     ) -> CacheEntry? {
-        // Try memory cache first
-        if let entry = memoryCache.object(forKey: key as NSString) {
+        cacheLock.lock()
+        let entry = memoryCache[key]
+        cacheLock.unlock()
+        
+        if let entry = entry {
             if !entry.isExpired(maxAge: maxAge) {
                 let age = Date().timeIntervalSince(entry.timestamp)
                 TNMLogger.Cache.hit(key: key, age: age)
-                return entry
+                return entry.sanitized()
             } else {
-                // Expired, remove
-                memoryCache.removeObject(forKey: key as NSString)
-                TNMLogger.debug("Cache entry expired (memory)", feature: "Cache", details: [
-                    "key": key
-                ])
+                cacheLock.lock()
+                memoryCache.removeValue(forKey: key)
+                memoryCacheSize -= entry.bodyString.utf8.count
+                cacheLock.unlock()
+                
+                TNMLogger.debug("Cache entry expired (memory)", feature: "Cache", details: ["key": key])
             }
         }
         
-        // Try disk cache
-        if let entry = loadFromDisk(key: key) {
-            if !entry.isExpired(maxAge: maxAge) {
-                // Store in memory cache for faster access
-                memoryCache.setObject(entry, forKey: key as NSString)
+        if let diskEntry = loadFromDisk(key: key) {
+            if !diskEntry.isExpired(maxAge: maxAge) {
+               
+                let sanitizedEntry = diskEntry.sanitized()
                 
-                let age = Date().timeIntervalSince(entry.timestamp)
+                cacheLock.lock()
+                memoryCache[key] = sanitizedEntry
+                memoryCacheSize += sanitizedEntry.bodyString.utf8.count
+                evictIfNeeded()
+                cacheLock.unlock()
+                
+                let age = Date().timeIntervalSince(sanitizedEntry.timestamp)
                 TNMLogger.Cache.hit(key: key, age: age)
-                return entry
+                return sanitizedEntry
             } else {
-                // Expired, remove
                 removeFromDisk(key: key)
-                TNMLogger.debug("Cache entry expired (disk)", feature: "Cache", details: [
-                    "key": key
-                ])
+                TNMLogger.debug("Cache entry expired (disk)", feature: "Cache", details: ["key": key])
             }
         }
         
@@ -90,9 +94,6 @@ class TNMCacheManager {
         return nil
     }
     
-    /**
-     * Store response in cache
-     */
     func cacheResponse(
         for key: String,
         statusCode: Int,
@@ -100,35 +101,38 @@ class TNMCacheManager {
         body: Data,
         etag: String?
     ) {
+        
+        let bodyString = String(data: body, encoding: .utf8) ?? ""
+        
         let entry = CacheEntry(
             statusCode: statusCode,
             headers: headers,
-            body: body,
+            bodyString: bodyString,
             etag: etag,
             timestamp: Date()
         )
         
-        // Store in memory
-        memoryCache.setObject(entry, forKey: key as NSString, cost: body.count)
+        cacheLock.lock()
+        memoryCache[key] = entry
+        memoryCacheSize += bodyString.utf8.count
+        evictIfNeeded()
+        cacheLock.unlock()
         
-        // Store on disk
-        saveToDisk(key: key, entry: entry)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.saveToDisk(key: key, entry: entry)
+        }
         
-        TNMLogger.Cache.stored(key: key, size: body.count)
+        TNMLogger.Cache.stored(key: key, size: bodyString.utf8.count)
     }
     
-    /**
-     * Clear cache for specific domain
-     */
     func clearCache(for domain: String) {
-        TNMLogger.debug("Clearing cache for domain", feature: "Cache", details: [
-            "domain": domain
-        ])
+        TNMLogger.debug("Clearing cache for domain", feature: "Cache", details: ["domain": domain])
         
-        // Clear from memory
-        memoryCache.removeAllObjects()
+        cacheLock.lock()
+        memoryCache.removeAll()
+        memoryCacheSize = 0
+        cacheLock.unlock()
         
-        // Clear from disk (matching domain prefix)
         var clearedCount = 0
         if let files = try? fileManager.contentsOfDirectory(at: diskCachePath, includingPropertiesForKeys: nil) {
             for file in files {
@@ -140,37 +144,25 @@ class TNMCacheManager {
         }
         
         TNMLogger.Cache.cleared(domain: domain)
-        TNMLogger.debug("Cache cleared", feature: "Cache", details: [
-            "domain": domain,
-            "filesRemoved": clearedCount
-        ])
     }
     
-    /**
-     * Clear all cache
-     */
     func clearAllCache() {
         TNMLogger.debug("Clearing all cache", feature: "Cache")
         
-        memoryCache.removeAllObjects()
+        cacheLock.lock()
+        memoryCache.removeAll()
+        memoryCacheSize = 0
+        cacheLock.unlock()
         
-        var clearedCount = 0
         if let files = try? fileManager.contentsOfDirectory(at: diskCachePath, includingPropertiesForKeys: nil) {
             for file in files {
                 try? fileManager.removeItem(at: file)
-                clearedCount += 1
             }
         }
         
         TNMLogger.Cache.cleared(domain: nil)
-        TNMLogger.debug("All cache cleared", feature: "Cache", details: [
-            "filesRemoved": clearedCount
-        ])
     }
     
-    /**
-     * Generate cache key from URL
-     */
     func generateKey(url: String, method: String = "GET") -> String {
         return "\(method)-\(url)".sha256()
     }
@@ -179,17 +171,12 @@ class TNMCacheManager {
     
     private func loadFromDisk(key: String) -> CacheEntry? {
         let filePath = diskCachePath.appendingPathComponent(sanitizeKey(key))
-        
-        guard let data = try? Data(contentsOf: filePath) else {
-            return nil
-        }
-        
+        guard let data = try? Data(contentsOf: filePath) else { return nil }
         return try? JSONDecoder().decode(CacheEntry.self, from: data)
     }
     
     private func saveToDisk(key: String, entry: CacheEntry) {
         let filePath = diskCachePath.appendingPathComponent(sanitizeKey(key))
-        
         if let data = try? JSONEncoder().encode(entry) {
             try? data.write(to: filePath)
         }
@@ -201,46 +188,84 @@ class TNMCacheManager {
     }
     
     private func sanitizeKey(_ key: String) -> String {
-        // Remove invalid filename characters
         return key.replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: "?", with: "-")
+    }
+    
+    private func evictIfNeeded() {
+        if memoryCacheSize > maxMemoryCacheSize {
+            let sortedEntries = memoryCache.sorted { $0.value.timestamp < $1.value.timestamp }
+            
+            for (key, entry) in sortedEntries {
+                memoryCache.removeValue(forKey: key)
+                memoryCacheSize -= entry.bodyString.utf8.count
+                
+                if memoryCacheSize <= maxMemoryCacheSize / 2 {
+                    break
+                }
+            }
+            
+            TNMLogger.debug("Cache evicted by size", feature: "Cache", details: [
+                "newSize": "\(memoryCacheSize) bytes"
+            ])
+        }
+        
+        if memoryCache.count > maxMemoryCacheCount {
+            let sortedEntries = memoryCache.sorted { $0.value.timestamp < $1.value.timestamp }
+            let toRemove = memoryCache.count - maxMemoryCacheCount
+            
+            for i in 0..<toRemove {
+                let (key, entry) = sortedEntries[i]
+                memoryCache.removeValue(forKey: key)
+                memoryCacheSize -= entry.bodyString.utf8.count
+            }
+            
+            TNMLogger.debug("Cache evicted by count", feature: "Cache", details: [
+                "newCount": memoryCache.count
+            ])
+        }
     }
 }
 
 // MARK: - Cache Entry
 
-class CacheEntry: NSObject, Codable {
+struct CacheEntry: Codable {
     let statusCode: Int
     let headers: [String: String]
-    let body: Data
+    let bodyString: String
     let etag: String?
     let timestamp: Date
     
-    init(statusCode: Int, headers: [String: String], body: Data, etag: String?, timestamp: Date) {
-        self.statusCode = statusCode
-        self.headers = headers
-        self.body = body
-        self.etag = etag
-        self.timestamp = timestamp
+    func isExpired(maxAge: TimeInterval?) -> Bool {
+        guard let maxAge = maxAge else { return false }
+        return Date().timeIntervalSince(timestamp) > maxAge
     }
     
-    func isExpired(maxAge: TimeInterval?) -> Bool {
-        guard let maxAge = maxAge else {
-            return false
+    func sanitized() -> CacheEntry {
+        // Forçar re-criação de todos os valores como Swift puros
+        let pureHeaders: [String: String] = headers.reduce(into: [:]) { result, pair in
+            // Força criação de String novos
+            let key = String(pair.key)
+            let value = String(pair.value)
+            result[key] = value
         }
         
-        return Date().timeIntervalSince(timestamp) > maxAge
+        return CacheEntry(
+            statusCode: self.statusCode,
+            headers: pureHeaders,
+            bodyString: String(self.bodyString), // Nova instância
+            etag: self.etag.map { String($0) },  // Nova instância se existir
+            timestamp: self.timestamp
+        )
     }
 }
 
-// MARK: - String Extension for SHA256
+// MARK: - String Extension
 
 extension String {
     func sha256() -> String {
-        guard let data = self.data(using: .utf8) else {
-            return self
-        }
+        guard let data = self.data(using: .utf8) else { return self }
         
         var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
         data.withUnsafeBytes {
@@ -250,5 +275,3 @@ extension String {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
 }
-
-import CommonCrypto

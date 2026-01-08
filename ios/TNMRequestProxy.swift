@@ -85,7 +85,7 @@ class TNMRequestProxy: TiProxy {
     
     /**
      * Send the request
-     * 
+     *
      * @param arguments Unused arguments array (required by Titanium)
      */
     @objc(send:)
@@ -115,7 +115,11 @@ class TNMRequestProxy: TiProxy {
         // Check cache policy
         if let policy = cachePolicy, policy == "cache-first" {
             if let cachedEntry = cacheManager.getCachedResponse(for: cacheKey, maxAge: cacheTTL) {
-                handleCachedResponse(cachedEntry)
+                DispatchQueue.main.async { [weak self] in
+                    autoreleasepool {
+                        self?.handleCachedResponse(cachedEntry)
+                    }
+                }
                 return
             }
         }
@@ -185,7 +189,7 @@ class TNMRequestProxy: TiProxy {
     
     /**
      * Cancel the request
-     * 
+     *
      * @param arguments Unused arguments array (required by Titanium)
      */
     @objc(cancel:)
@@ -269,19 +273,19 @@ class TNMRequestProxy: TiProxy {
     }
     
     private func handleCachedResponse(_ entry: CacheEntry) {
-        isActive = false
         
-        let bodyString = String(data: entry.body, encoding: .utf8) ?? ""
+        isActive = false
         
         TNMLogger.debug("Returning cached response", feature: "Request", details: [
             "requestId": requestId,
             "statusCode": entry.statusCode
         ])
         
+       
         fireEvent("complete", with: [
             "statusCode": entry.statusCode,
             "headers": entry.headers,
-            "body": bodyString,
+            "body": entry.bodyString,
             "success": true,
             "cached": true,
             "duration": 0
