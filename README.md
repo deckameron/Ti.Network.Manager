@@ -11,7 +11,7 @@ Ti.Network.Manager is a comprehensive networking solution that extends Titanium'
 ### Roadmap
 
 - [x] v1.0: Core 10 features for iOS
-- [ ] v2.0: Android support
+- [x] v2.0: Android support
 - [ ] v2.1: Upload/download queuing system
 
 
@@ -1111,6 +1111,8 @@ function uploadProfilePicture(imageBlob) {
 ### Feature 9: HTTP/2 & HTTP/3 Support
 
 **Automatic support for modern HTTP protocols.** Provides better performance through multiplexing and header compression.
+
+- ⚠️ **HTTP/3**: Available on iOS 15+, not available on Android (OkHttp 4.x limitation)
 
 HTTP/2 and HTTP/3 support is automatic and requires no special configuration. The module uses `URLSession` which automatically negotiates the best protocol with the server.
 
