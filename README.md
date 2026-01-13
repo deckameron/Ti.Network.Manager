@@ -72,7 +72,10 @@ Add the module to your `tiapp.xml`:
 
 ```xml
 <modules>
+    <module>ti.network.manager</module>
+    <!-- OR -->
     <module platform="iphone">ti.network.manager</module>
+    <module platform="android">ti.network.manager</module>
 </modules>
 ```
 
