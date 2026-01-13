@@ -59,6 +59,7 @@ class TNMRequestManager {
         
         // Execute with retry
         executeWithRetry(
+            currentAttempt: 0,
             requestId: requestId,
             session: session,
             url: url,
@@ -88,6 +89,7 @@ class TNMRequestManager {
     // MARK: - Private Methods
     
     private func executeWithRetry(
+        currentAttempt: Int,
         requestId: String,
         session: URLSession,
         url: URL,
@@ -105,6 +107,8 @@ class TNMRequestManager {
         request.httpMethod = method
         request.httpBody = body
         
+        var currentAttemptCounter = currentAttempt
+        
         // Add headers
         if let headers = headers {
             for (key, value) in headers {
@@ -115,13 +119,20 @@ class TNMRequestManager {
         TNMLogger.debug("Creating request task", feature: "Request", details: [
             "requestId": requestId,
             "attempt": attempt,
-            "hasRetryConfig": retryConfig != nil
+            "hasRetryConfig": retryConfig != nil,
+            "currentAttemptCounter": currentAttemptCounter
         ])
         
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
             
             if let error = error {
+                
+                // Notify that we will retry
+                let willRetryAgain = currentAttemptCounter + 1 < (retryConfig?.maxRetries ?? 0)
+                currentAttemptCounter = currentAttemptCounter + 1
+                onError(error, willRetryAgain)
+                
                 // Check if should retry
                 if let retryConfig = retryConfig,
                    attempt < retryConfig.maxRetries,
@@ -140,12 +151,10 @@ class TNMRequestManager {
                         delay: delay
                     )
                     
-                    // Notify that we will retry
-                    onError(error, true)
-                    
                     // Retry after delay
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                         self.executeWithRetry(
+                            currentAttempt: currentAttemptCounter,
                             requestId: requestId,
                             session: session,
                             url: url,
@@ -170,7 +179,6 @@ class TNMRequestManager {
                     self.retryState.removeValue(forKey: requestId)
                     
                     TNMLogger.Request.error(requestId: requestId, error: error)
-                    onError(error, false)
                 }
                 return
             }
@@ -217,6 +225,7 @@ class TNMRequestManager {
                 
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                     self.executeWithRetry(
+                        currentAttempt: currentAttemptCounter,
                         requestId: requestId,
                         session: session,
                         url: url,
