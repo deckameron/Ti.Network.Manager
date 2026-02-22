@@ -5,7 +5,6 @@
 //  Created by Douglas Alves on 02/01/26.
 //
 
-
 /**
  * Ti.Network.Manager - Request Manager
  * Handles standard HTTP requests with retry logic
@@ -127,16 +126,22 @@ class TNMRequestManager {
             guard let self = self else { return }
             
             if let error = error {
+                // Create error copy for thread safety
+                let errorCopy = NSError(
+                    domain: (error as NSError).domain,
+                    code: (error as NSError).code,
+                    userInfo: (error as NSError).userInfo
+                )
                 
                 // Notify that we will retry
                 let willRetryAgain = currentAttemptCounter + 1 < (retryConfig?.maxRetries ?? 0)
                 currentAttemptCounter = currentAttemptCounter + 1
-                onError(error, willRetryAgain)
+                onError(errorCopy, willRetryAgain)
                 
                 // Check if should retry
                 if let retryConfig = retryConfig,
                    attempt < retryConfig.maxRetries,
-                   self.shouldRetry(error: error, retryConfig: retryConfig) {
+                   self.shouldRetry(error: errorCopy, retryConfig: retryConfig) {
                     
                     // Calculate delay
                     let delay = self.calculateRetryDelay(
@@ -178,7 +183,7 @@ class TNMRequestManager {
                     self.activeTasks.removeValue(forKey: requestId)
                     self.retryState.removeValue(forKey: requestId)
                     
-                    TNMLogger.Request.error(requestId: requestId, error: error)
+                    TNMLogger.Request.error(requestId: requestId, error: errorCopy)
                 }
                 return
             }
@@ -243,12 +248,25 @@ class TNMRequestManager {
                 return
             }
             
-            // Success or non-retryable status
+            // Success or non-retryable status - THREAD SAFE
+            // Create all copies BEFORE calling onComplete
+            let statusCodeValue = httpResponse.statusCode
+            
+            // Extract headers with explicit String copies
             var responseHeaders: [String: String] = [:]
             for (key, value) in httpResponse.allHeaderFields {
                 if let keyString = key as? String, let valueString = value as? String {
-                    responseHeaders[keyString] = valueString
+                    // Force new String instances
+                    responseHeaders[String(keyString)] = String(valueString)
                 }
+            }
+            
+            // Copy Data if exists
+            let dataCopy: Data?
+            if let data = data {
+                dataCopy = Data(data)
+            } else {
+                dataCopy = nil
             }
             
             self.activeTasks.removeValue(forKey: requestId)
@@ -257,11 +275,12 @@ class TNMRequestManager {
             let duration = Date().timeIntervalSince(startTime)
             TNMLogger.Request.completed(
                 requestId: requestId,
-                statusCode: statusCode,
+                statusCode: statusCodeValue,
                 duration: duration
             )
             
-            onComplete(statusCode, responseHeaders, data)
+            // Call with thread-safe copies
+            onComplete(statusCodeValue, responseHeaders, dataCopy)
         }
         
         task.priority = priority
