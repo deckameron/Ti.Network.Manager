@@ -174,12 +174,14 @@ class TNMRequestProxy: TiProxy {
                 self?.handleProgress(received: received, total: total)
             },
             onComplete: { [weak self] statusCode, headers, data in
-                self?.handleComplete(
-                    statusCode: statusCode,
-                    headers: headers,
-                    data: data,
-                    cacheKey: cacheKey
-                )
+                DispatchQueue.main.async {
+                    self?.handleComplete(
+                        statusCode: statusCode,
+                        headers: headers,
+                        data: data,
+                        cacheKey: cacheKey
+                    )
+                }
             },
             onError: { [weak self] error, willRetry in
                 self?.handleError(error, willRetry: willRetry)

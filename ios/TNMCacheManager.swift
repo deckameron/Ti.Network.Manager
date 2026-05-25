@@ -51,23 +51,24 @@ class TNMCacheManager {
         for key: String,
         maxAge: TimeInterval?
     ) -> CacheEntry? {
+
         cacheLock.lock()
         let entry = memoryCache[key]
-        cacheLock.unlock()
-        
+
         if let entry = entry {
             if !entry.isExpired(maxAge: maxAge) {
+                cacheLock.unlock()
                 let age = Date().timeIntervalSince(entry.timestamp)
                 TNMLogger.Cache.hit(key: key, age: age)
                 return entry.sanitized()
             } else {
-                cacheLock.lock()
                 memoryCache.removeValue(forKey: key)
-                memoryCacheSize -= entry.bodyString.utf8.count
+                memoryCacheSize = max(0, memoryCacheSize - entry.bodyString.utf8.count)
                 cacheLock.unlock()
-                
                 TNMLogger.debug("Cache entry expired (memory)", feature: "Cache", details: ["key": key])
             }
+        } else {
+            cacheLock.unlock()
         }
         
         if let diskEntry = loadFromDisk(key: key) {
@@ -199,7 +200,7 @@ class TNMCacheManager {
             
             for (key, entry) in sortedEntries {
                 memoryCache.removeValue(forKey: key)
-                memoryCacheSize -= entry.bodyString.utf8.count
+                memoryCacheSize = max(0, memoryCacheSize - entry.bodyString.utf8.count)
                 
                 if memoryCacheSize <= maxMemoryCacheSize / 2 {
                     break
@@ -218,7 +219,7 @@ class TNMCacheManager {
             for i in 0..<toRemove {
                 let (key, entry) = sortedEntries[i]
                 memoryCache.removeValue(forKey: key)
-                memoryCacheSize -= entry.bodyString.utf8.count
+                memoryCacheSize = max(0, memoryCacheSize - entry.bodyString.utf8.count)
             }
             
             TNMLogger.debug("Cache evicted by count", feature: "Cache", details: [
@@ -243,9 +244,7 @@ struct CacheEntry: Codable {
     }
     
     func sanitized() -> CacheEntry {
-        // Forçar re-criação de todos os valores como Swift puros
         let pureHeaders: [String: String] = headers.reduce(into: [:]) { result, pair in
-            // Força criação de String novos
             let key = String(pair.key)
             let value = String(pair.value)
             result[key] = value
@@ -254,8 +253,8 @@ struct CacheEntry: Codable {
         return CacheEntry(
             statusCode: self.statusCode,
             headers: pureHeaders,
-            bodyString: String(self.bodyString), // Nova instância
-            etag: self.etag.map { String($0) },  // Nova instância se existir
+            bodyString: String(self.bodyString),
+            etag: self.etag.map { String($0) },
             timestamp: self.timestamp
         )
     }
