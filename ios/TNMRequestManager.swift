@@ -9,6 +9,7 @@
  * Ti.Network.Manager - Request Manager
  * Handles standard HTTP requests with retry logic
  * Supports automatic retry with exponential/linear backoff
+ * Session pool: one URLSession per host+timeout, reusing TCP/TLS connections
  */
 
 import Foundation
@@ -19,6 +20,13 @@ class TNMRequestManager {
     
     private var activeTasks: [String: URLSessionDataTask] = [:]
     private var retryState: [String: RetryState] = [:]
+    
+    // Session pool: keyed by "host_timeout" to reuse TCP/TLS connections
+    // across requests to the same host with the same timeout setting.
+    // One SessionDelegate per session routes progress events to the right task.
+    private var sessionPool: [String: URLSession] = [:]
+    private var delegatePool: [String: SessionDelegate] = [:]
+    private let sessionPoolLock = NSLock()
     
     // MARK: - Public Methods
     
@@ -32,41 +40,36 @@ class TNMRequestManager {
         headers: [String: String]?,
         body: Data?,
         priority: Float,
+        timeout: Double,
         retryConfig: RetryConfiguration?,
         certificateValidator: CertificateValidator?,
         onProgress: ((Int64, Int64) -> Void)?,
         onComplete: @escaping (Int, [String: String], Data?) -> Void,
-        onError: @escaping (Error, Bool) -> Void // Bool indicates if will retry
+        onError: @escaping (Error, Bool) -> Void
     ) {
         TNMLogger.Request.created(requestId: requestId, url: url.absoluteString, method: method)
         
         let priorityString = priorityToString(priority)
         TNMLogger.Request.started(requestId: requestId, priority: priorityString)
         
-        // Create session with certificate validation
-        let delegate = RequestDelegate(
-            requestId: requestId,
-            certificateValidator: certificateValidator,
-            onProgress: onProgress
+        let (session, delegate) = getOrCreateSession(
+            for: url,
+            timeout: timeout,
+            certificateValidator: certificateValidator
         )
         
-        let session = URLSession(
-            configuration: .default,
-            delegate: delegate,
-            delegateQueue: nil
-        )
-        
-        // Execute with retry
         executeWithRetry(
             currentAttempt: 0,
             requestId: requestId,
             session: session,
+            sessionDelegate: delegate,
             url: url,
             method: method,
             headers: headers,
             body: body,
             priority: priority,
             retryConfig: retryConfig,
+            onProgress: onProgress,
             attempt: 1,
             startTime: Date(),
             onComplete: onComplete,
@@ -80,9 +83,66 @@ class TNMRequestManager {
     func cancelRequest(requestId: String) {
         TNMLogger.Request.cancelled(requestId: requestId)
         
-        activeTasks[requestId]?.cancel()
-        activeTasks.removeValue(forKey: requestId)
+        if let task = activeTasks[requestId] {
+            // Unregister progress handler from the shared session delegate
+            // before cancelling, so no stale callbacks fire.
+            sessionPoolLock.lock()
+            for delegate in delegatePool.values {
+                delegate.unregister(taskIdentifier: task.taskIdentifier)
+            }
+            sessionPoolLock.unlock()
+            
+            task.cancel()
+            activeTasks.removeValue(forKey: requestId)
+        }
+        
         retryState.removeValue(forKey: requestId)
+    }
+    
+    // MARK: - Session Pool
+    
+    /**
+     * Returns an existing session for the given host+timeout combination,
+     * or creates a new one. Each session owns a SessionDelegate that routes
+     * per-task progress events without needing a new URLSession per request.
+     */
+    private func getOrCreateSession(
+        for url: URL,
+        timeout: Double,
+        certificateValidator: CertificateValidator?
+    ) -> (URLSession, SessionDelegate) {
+        let host = url.host ?? "default"
+        let poolKey = "\(host)_\(timeout)"
+        
+        sessionPoolLock.lock()
+        defer { sessionPoolLock.unlock() }
+        
+        if let existingSession = sessionPool[poolKey],
+           let existingDelegate = delegatePool[poolKey] {
+            TNMLogger.debug("Reusing session from pool", feature: "Request", details: [
+                "host": host,
+                "timeout": String(format: "%.1f seconds", timeout)
+            ])
+            return (existingSession, existingDelegate)
+        }
+        
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
+        
+        let delegate = SessionDelegate(certificateValidator: certificateValidator)
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        
+        sessionPool[poolKey] = session
+        delegatePool[poolKey] = delegate
+        
+        TNMLogger.debug("Created new session in pool", feature: "Request", details: [
+            "host": host,
+            "timeout": String(format: "%.1f seconds", timeout),
+            "poolSize": sessionPool.count
+        ])
+        
+        return (session, delegate)
     }
     
     // MARK: - Private Methods
@@ -91,12 +151,14 @@ class TNMRequestManager {
         currentAttempt: Int,
         requestId: String,
         session: URLSession,
+        sessionDelegate: SessionDelegate,
         url: URL,
         method: String,
         headers: [String: String]?,
         body: Data?,
         priority: Float,
         retryConfig: RetryConfiguration?,
+        onProgress: ((Int64, Int64) -> Void)?,
         attempt: Int,
         startTime: Date,
         onComplete: @escaping (Int, [String: String], Data?) -> Void,
@@ -108,7 +170,6 @@ class TNMRequestManager {
         
         var currentAttemptCounter = currentAttempt
         
-        // Add headers
         if let headers = headers {
             for (key, value) in headers {
                 request.setValue(value, forHTTPHeaderField: key)
@@ -125,25 +186,27 @@ class TNMRequestManager {
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
             
+            // Unregister progress handler now that the task is done
+            sessionDelegate.unregister(taskIdentifier: (self.activeTasks[requestId]?.taskIdentifier ?? -1))
+            
             if let error = error {
-                // Create error copy for thread safety
                 let errorCopy = NSError(
                     domain: (error as NSError).domain,
                     code: (error as NSError).code,
                     userInfo: (error as NSError).userInfo
                 )
                 
-                // Notify that we will retry
                 let willRetryAgain = currentAttemptCounter + 1 < (retryConfig?.maxRetries ?? 0)
                 currentAttemptCounter = currentAttemptCounter + 1
-                onError(errorCopy, willRetryAgain)
                 
-                // Check if should retry
+                DispatchQueue.main.async {
+                    onError(errorCopy, willRetryAgain)
+                }
+                
                 if let retryConfig = retryConfig,
                    attempt < retryConfig.maxRetries,
                    self.shouldRetry(error: errorCopy, retryConfig: retryConfig) {
                     
-                    // Calculate delay
                     let delay = self.calculateRetryDelay(
                         attempt: attempt,
                         backoffType: retryConfig.backoffType,
@@ -156,18 +219,19 @@ class TNMRequestManager {
                         delay: delay
                     )
                     
-                    // Retry after delay
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                         self.executeWithRetry(
                             currentAttempt: currentAttemptCounter,
                             requestId: requestId,
                             session: session,
+                            sessionDelegate: sessionDelegate,
                             url: url,
                             method: method,
                             headers: headers,
                             body: body,
                             priority: priority,
                             retryConfig: retryConfig,
+                            onProgress: onProgress,
                             attempt: attempt + 1,
                             startTime: startTime,
                             onComplete: onComplete,
@@ -175,7 +239,6 @@ class TNMRequestManager {
                         )
                     }
                 } else {
-                    // No retry, final error
                     if let retryConfig = retryConfig, attempt >= retryConfig.maxRetries {
                         TNMLogger.Retry.exhausted(attempts: attempt)
                     }
@@ -197,13 +260,15 @@ class TNMRequestManager {
                 self.activeTasks.removeValue(forKey: requestId)
                 
                 TNMLogger.Request.error(requestId: requestId, error: error)
-                onError(error, false)
+                
+                DispatchQueue.main.async {
+                    onError(error, false)
+                }
                 return
             }
             
             let statusCode = httpResponse.statusCode
             
-            // Check if should retry based on status code
             if let retryConfig = retryConfig,
                attempt < retryConfig.maxRetries,
                retryConfig.retryOn.contains(statusCode) {
@@ -226,19 +291,23 @@ class TNMRequestManager {
                     userInfo: [NSLocalizedDescriptionKey: "HTTP \(statusCode)"]
                 )
                 
-                onError(error, true)
+                DispatchQueue.main.async {
+                    onError(error, true)
+                }
                 
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                     self.executeWithRetry(
                         currentAttempt: currentAttemptCounter,
                         requestId: requestId,
                         session: session,
+                        sessionDelegate: sessionDelegate,
                         url: url,
                         method: method,
                         headers: headers,
                         body: body,
                         priority: priority,
                         retryConfig: retryConfig,
+                        onProgress: onProgress,
                         attempt: attempt + 1,
                         startTime: startTime,
                         onComplete: onComplete,
@@ -248,20 +317,16 @@ class TNMRequestManager {
                 return
             }
             
-            // Success or non-retryable status - THREAD SAFE
-            // Create all copies BEFORE calling onComplete
+            // Success or non-retryable status
             let statusCodeValue = httpResponse.statusCode
             
-            // Extract headers with explicit String copies
             var responseHeaders: [String: String] = [:]
             for (key, value) in httpResponse.allHeaderFields {
                 if let keyString = key as? String, let valueString = value as? String {
-                    // Force new String instances
                     responseHeaders[String(keyString)] = String(valueString)
                 }
             }
             
-            // Copy Data if exists
             let dataCopy: Data?
             if let data = data {
                 dataCopy = Data(data)
@@ -279,8 +344,18 @@ class TNMRequestManager {
                 duration: duration
             )
             
-            // Call with thread-safe copies
-            onComplete(statusCodeValue, responseHeaders, dataCopy)
+            DispatchQueue.main.async {
+                onComplete(statusCodeValue, responseHeaders, dataCopy)
+            }
+        }
+        
+        // Register progress handler BEFORE resuming, to avoid missing early events
+        if let onProgress = onProgress {
+            sessionDelegate.register(
+                taskIdentifier: task.taskIdentifier,
+                requestId: requestId,
+                onProgress: onProgress
+            )
         }
         
         task.priority = priority
@@ -291,9 +366,13 @@ class TNMRequestManager {
     private func shouldRetry(error: Error, retryConfig: RetryConfiguration) -> Bool {
         let nsError = error as NSError
         
-        // Network errors that are retryable
+        // Transient network errors that make sense to retry automatically.
+        // NSURLErrorTimedOut is intentionally excluded: the developer explicitly
+        // chose a timeout value, so treating it as a retryable condition would
+        // silently multiply the effective wait time by maxRetries. If the caller
+        // wants to retry on timeout, they should include the HTTP status code
+        // equivalent or handle it in their own error callback.
         let retryableErrors = [
-            NSURLErrorTimedOut,
             NSURLErrorCannotFindHost,
             NSURLErrorCannotConnectToHost,
             NSURLErrorNetworkConnectionLost,
@@ -321,10 +400,8 @@ class TNMRequestManager {
         
         switch backoffType {
         case "exponential":
-            // 2^attempt * baseDelay (e.g., 1s, 2s, 4s, 8s)
             delay = baseDelay * pow(2.0, Double(attempt - 1))
         case "linear":
-            // attempt * baseDelay (e.g., 1s, 2s, 3s, 4s)
             delay = baseDelay * Double(attempt)
         default:
             delay = baseDelay
@@ -354,13 +431,32 @@ class TNMRequestManager {
 
 struct RetryConfiguration {
     let maxRetries: Int
-    let retryOn: [Int] // HTTP status codes to retry on
-    let backoffType: String // "exponential" or "linear"
-    let baseDelay: TimeInterval // Base delay in seconds
+    let retryOn: [Int]
+    let backoffType: String
+    let baseDelay: TimeInterval
     
     init(params: [String: Any]) {
-        maxRetries = params["max"] as? Int ?? 3
-        retryOn = params["retryOn"] as? [Int] ?? [500, 502, 503, 504]
+        // Titanium's Kroll bridge converts all JS numbers (which are doubles)
+        // to NSNumber wrapping a Double. Swift's `as? Int` fails for those,
+        // so we try Int first (direct integer NSNumber) and fall back to Double.
+        if let v = params["max"] as? Int {
+            maxRetries = v
+        } else if let v = params["max"] as? Double {
+            maxRetries = Int(v)
+        } else {
+            maxRetries = 3
+        }
+        
+        // Same issue for the retryOn array: JS [500, 503] arrives as [NSNumber(double)],
+        // so [Int] cast fails. Try both element types.
+        if let array = params["retryOn"] as? [Int] {
+            retryOn = array
+        } else if let array = params["retryOn"] as? [Double] {
+            retryOn = array.map { Int($0) }
+        } else {
+            retryOn = [500, 502, 503, 504]
+        }
+        
         backoffType = params["backoff"] as? String ?? "exponential"
         baseDelay = params["baseDelay"] as? TimeInterval ?? 1.0
         
@@ -380,45 +476,66 @@ struct RetryState {
     var lastError: Error?
 }
 
-// MARK: - Request Delegate
+// MARK: - Session Delegate
+//
+// Shared across all requests to the same host. Routes progress and certificate
+// events to the right per-task handler without needing a new URLSession per request.
 
-class RequestDelegate: NSObject, URLSessionDataDelegate {
+class SessionDelegate: NSObject, URLSessionDataDelegate {
     
-    private let requestId: String
     private let certificateValidator: CertificateValidator?
-    private let onProgress: ((Int64, Int64) -> Void)?
     
-    init(
-        requestId: String,
-        certificateValidator: CertificateValidator?,
-        onProgress: ((Int64, Int64) -> Void)?
-    ) {
-        self.requestId = requestId
+    // taskIdentifier -> (requestId, progressCallback)
+    private var progressHandlers: [Int: (String, (Int64, Int64) -> Void)] = [:]
+    private let handlersLock = NSLock()
+    
+    init(certificateValidator: CertificateValidator?) {
         self.certificateValidator = certificateValidator
-        self.onProgress = onProgress
     }
     
-    // Progress tracking
+    func register(
+        taskIdentifier: Int,
+        requestId: String,
+        onProgress: @escaping (Int64, Int64) -> Void
+    ) {
+        handlersLock.lock()
+        progressHandlers[taskIdentifier] = (requestId, onProgress)
+        handlersLock.unlock()
+    }
+    
+    func unregister(taskIdentifier: Int) {
+        handlersLock.lock()
+        progressHandlers.removeValue(forKey: taskIdentifier)
+        handlersLock.unlock()
+    }
+    
+    // Progress tracking — routed by taskIdentifier
     func urlSession(
         _ session: URLSession,
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
-        if let onProgress = onProgress {
-            let received = dataTask.countOfBytesReceived
-            let expected = dataTask.countOfBytesExpectedToReceive
-            
-            TNMLogger.Request.progress(
-                requestId: requestId,
-                received: received,
-                total: expected
-            )
-            
+        handlersLock.lock()
+        let entry = progressHandlers[dataTask.taskIdentifier]
+        handlersLock.unlock()
+        
+        guard let (requestId, onProgress) = entry else { return }
+        
+        let received = dataTask.countOfBytesReceived
+        let expected = dataTask.countOfBytesExpectedToReceive
+        
+        TNMLogger.Request.progress(
+            requestId: requestId,
+            received: received,
+            total: expected
+        )
+        
+        DispatchQueue.main.async {
             onProgress(received, expected)
         }
     }
     
-    // Certificate validation
+    // Certificate validation — same for all tasks in this session (same host)
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
@@ -429,19 +546,16 @@ class RequestDelegate: NSObject, URLSessionDataDelegate {
             return
         }
         
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
-            if let serverTrust = challenge.protectionSpace.serverTrust {
-                if certificateValidator.validate(serverTrust: serverTrust, for: challenge.protectionSpace.host) {
-                    let credential = URLCredential(trust: serverTrust)
-                    completionHandler(.useCredential, credential)
-                } else {
-                    completionHandler(.cancelAuthenticationChallenge, nil)
-                }
-            } else {
-                completionHandler(.cancelAuthenticationChallenge, nil)
-            }
-        } else {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
             completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        
+        if certificateValidator.validate(serverTrust: serverTrust, for: challenge.protectionSpace.host) {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+        } else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
 }

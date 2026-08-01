@@ -34,6 +34,7 @@ public class TNMRequestProxy extends KrollProxy {
 
     private boolean isActive = false;
     private long startTime;
+    private long timeoutMs = 60000; // default 60s
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
@@ -51,6 +52,10 @@ public class TNMRequestProxy extends KrollProxy {
         this.url = params.optString("url", "");
         this.method = params.optString("method", "GET").toUpperCase();
         this.priority = params.optString("priority", "normal");
+
+        if (params.containsKey("timeout")) {
+            this.timeoutMs = ((Number) Objects.requireNonNull(params.get("timeout"))).longValue();
+        }
 
         // Headers
         if (params.containsKey("headers")) {
@@ -88,6 +93,7 @@ public class TNMRequestProxy extends KrollProxy {
         details.put("url", url);
         details.put("method", method);
         details.put("priority", priority);
+        details.put("timeout", timeoutMs);
         details.put("cachePolicy", cachePolicy != null ? cachePolicy : "none");
         TNMLogger.debug("Request proxy created", "Request", details);
     }
@@ -136,6 +142,7 @@ public class TNMRequestProxy extends KrollProxy {
                 headers,
                 body,
                 urlPriority,
+                timeoutMs,
                 retryConfig,
                 new TNMRequestManager.RequestCallback() {
                     @Override

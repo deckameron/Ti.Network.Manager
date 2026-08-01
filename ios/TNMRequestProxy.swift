@@ -1,11 +1,3 @@
-//
-//  TNMRequestProxy.swift
-//  TiNetworkManager
-//
-//  Created by Douglas Alves on 02/01/26.
-//
-
-
 /**
  * Ti.Network.Manager - Request Proxy
  * Proxy for standard HTTP requests
@@ -31,6 +23,7 @@ class TNMRequestProxy: TiProxy {
     private var headers: [String: String]
     private var body: String?
     private var priority: String
+    private var timeout: TimeInterval
     private var cachePolicy: String?
     private var cacheTTL: TimeInterval?
     private var retryConfig: RetryConfiguration?
@@ -59,6 +52,16 @@ class TNMRequestProxy: TiProxy {
         self.body = params["body"] as? String
         self.priority = params["priority"] as? String ?? "normal"
         
+        // Timeout: JS sends milliseconds (Ti.Network.createHTTPClient convention),
+        // internally we work in seconds (TimeInterval). Defaults to 60s when absent.
+        if let timeoutMs = params["timeout"] as? Double {
+            self.timeout = timeoutMs / 1000.0
+        } else if let timeoutMs = params["timeout"] as? Int {
+            self.timeout = TimeInterval(timeoutMs) / 1000.0
+        } else {
+            self.timeout = 60.0
+        }
+        
         // Cache configuration
         if let cacheConfig = params["cache"] as? [String: Any] {
             self.cachePolicy = cacheConfig["policy"] as? String
@@ -77,6 +80,7 @@ class TNMRequestProxy: TiProxy {
             "url": url,
             "method": method,
             "priority": priority,
+            "timeout": String(format: "%.1f seconds", timeout),
             "cachePolicy": cachePolicy ?? "none"
         ])
     }
@@ -102,7 +106,12 @@ class TNMRequestProxy: TiProxy {
                 "requestId": requestId,
                 "url": self.url
             ])
-            fireEvent("error", with: ["error": "Invalid URL"])
+            // ✅ Mesma razão do fix acima: nunca disparar fireEvent(...) de forma
+            // síncrona a partir de send(), já que send() costuma ser chamado a
+            // partir de um handler de toque/click ainda em andamento.
+            DispatchQueue.main.async { [weak self] in
+                self?.fireEvent("error", with: ["error": "Invalid URL"])
+            }
             return
         }
         
@@ -115,10 +124,20 @@ class TNMRequestProxy: TiProxy {
         // Check cache policy
         if let policy = cachePolicy, policy == "cache-first" {
             if let cachedEntry = cacheManager.getCachedResponse(for: cacheKey, maxAge: cacheTTL) {
+                // ✅ Despachar para o próximo ciclo do run loop, igual ao caminho de
+                // rede (TNMRequestManager sempre usa DispatchQueue.main.async para
+                // onComplete/onError). Antes, um cache hit chamava handleCachedResponse()
+                // direto, de forma síncrona — e como send() normalmente é chamado a
+                // partir de um handler de toque/click, o fireEvent("complete", ...)
+                // (e tudo que ele desencadeia no JS, incluindo abrir uma window nova
+                // inteira) rodava REENTRANTE, ainda dentro da pilha de chamada do
+                // próprio touchesEnded:withEvent: do UIKit, antes dele terminar de
+                // desempilhar. Essa reentrância é a causa raiz do crash
+                // "pointer authentication failure" / KrollBridge com classe de
+                // objeto variável: abrir uma árvore de proxies nova no meio do
+                // processamento do toque corrompe estado do UIKit/KrollContext.
                 DispatchQueue.main.async { [weak self] in
-                    autoreleasepool {
-                        self?.handleCachedResponse(cachedEntry)
-                    }
+                    self?.handleCachedResponse(cachedEntry)
                 }
                 return
             }
@@ -161,6 +180,21 @@ class TNMRequestProxy: TiProxy {
         let certificateValidator = certificatePinningManager.getValidator(for: url.host ?? "")
         
         // Execute request
+        //
+        // IMPORTANT: capture self strongly (not weakly) in these callbacks.
+        // Titanium's JS runtime can GC the proxy before an async response or
+        // timeout arrives — especially in Classic apps where proxies have no
+        // UI attachment to keep them alive. A weak capture would let the proxy
+        // (and its requestManager) be deallocated, causing the URLSession
+        // completion handler's `guard let self = self else { return }` to exit
+        // silently, with no complete/error event ever firing.
+        //
+        // The resulting temporary retain cycle
+        //   proxy → requestManager → activeTasks → task closure → proxy
+        // is intentional and safe: it breaks as soon as the task completes and
+        // is removed from activeTasks.
+        let retainedSelf = self
+        
         requestManager.executeRequest(
             requestId: requestId,
             url: url,
@@ -168,23 +202,22 @@ class TNMRequestProxy: TiProxy {
             headers: modifiedHeaders,
             body: bodyData,
             priority: urlPriority,
+            timeout: timeout,
             retryConfig: retryConfig,
             certificateValidator: certificateValidator,
-            onProgress: { [weak self] received, total in
-                self?.handleProgress(received: received, total: total)
+            onProgress: { received, total in
+                retainedSelf.handleProgress(received: received, total: total)
             },
-            onComplete: { [weak self] statusCode, headers, data in
-                DispatchQueue.main.async {
-                    self?.handleComplete(
-                        statusCode: statusCode,
-                        headers: headers,
-                        data: data,
-                        cacheKey: cacheKey
-                    )
-                }
+            onComplete: { statusCode, headers, data in
+                retainedSelf.handleComplete(
+                    statusCode: statusCode,
+                    headers: headers,
+                    data: data,
+                    cacheKey: cacheKey
+                )
             },
-            onError: { [weak self] error, willRetry in
-                self?.handleError(error, willRetry: willRetry)
+            onError: { error, willRetry in
+                retainedSelf.handleError(error, willRetry: willRetry, cacheKey: cacheKey)
             }
         )
     }
@@ -275,28 +308,69 @@ class TNMRequestProxy: TiProxy {
     }
     
     private func handleCachedResponse(_ entry: CacheEntry) {
-        
         isActive = false
+        
+        let bodyString = entry.bodyString
         
         TNMLogger.debug("Returning cached response", feature: "Request", details: [
             "requestId": requestId,
             "statusCode": entry.statusCode
         ])
         
-       
         fireEvent("complete", with: [
             "statusCode": entry.statusCode,
             "headers": entry.headers,
-            "body": entry.bodyString,
+            "body": bodyString,
             "success": true,
             "cached": true,
             "duration": 0
         ])
     }
     
-    private func handleError(_ error: Error, willRetry: Bool) {
-        if !willRetry {
-            isActive = false
+    private func handleError(_ error: Error, willRetry: Bool, cacheKey: String) {
+        // Intermediate retry attempt — just notify, nothing else to do yet.
+        if willRetry {
+            fireEvent("error", with: [
+                "error": error.localizedDescription,
+                "code": (error as NSError).code,
+                "willRetry": willRetry
+            ])
+            return
+        }
+
+        // Guard against a delayed/cancelled URLSessionTask completion arriving
+        // after this proxy already finished via handleComplete/handleCachedResponse
+        // (mirrors the guard in handleComplete). Without this, a stale error
+        // callback could fire a spurious extra 'error' — or, for network-first
+        // policy, a spurious extra 'complete' via the cache fallback below —
+        // after the request had already resolved successfully.
+        guard isActive else { return }
+
+        isActive = false
+        
+        // network-first fallback: the network attempt (plus all configured retries)
+        // has definitively failed. If a cached entry exists for this key, serve it
+        // instead of failing outright — regardless of its age/TTL, since at this
+        // point any data is better than none. The 'stale' flag lets the JS side
+        // distinguish this from a normal cache-first hit if it cares to.
+        if cachePolicy == "network-first",
+           let cachedEntry = cacheManager.getCachedResponse(for: cacheKey, maxAge: nil) {
+            
+            TNMLogger.warning("Network request failed, falling back to cache", feature: "Request", details: [
+                "requestId": requestId,
+                "cacheKey": cacheKey
+            ])
+            
+            fireEvent("complete", with: [
+                "statusCode": cachedEntry.statusCode,
+                "headers": cachedEntry.headers,
+                "body": cachedEntry.bodyString,
+                "success": true,
+                "cached": true,
+                "stale": true,
+                "duration": 0
+            ])
+            return
         }
         
         fireEvent("error", with: [

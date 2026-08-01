@@ -24,6 +24,7 @@ public class TNMRequestManager {
     private final OkHttpClient client;
     private final ConcurrentHashMap<String, Call> activeRequests = new ConcurrentHashMap<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private static final long DEFAULT_TIMEOUT_MS = 60000; // 60s
 
     // Priority queue for requests
     private final PriorityQueue<PriorityRequest> requestQueue = new PriorityQueue<>();
@@ -57,6 +58,7 @@ public class TNMRequestManager {
             Map<String, String> headers,
             String body,
             float priority,
+            long timeoutMs,
             RetryConfiguration retryConfig,
             RequestCallback callback
     ) {
@@ -112,6 +114,7 @@ public class TNMRequestManager {
                 requestId,
                 request,
                 priority,
+                timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS,
                 retryConfig,
                 0,
                 callback
@@ -148,9 +151,14 @@ public class TNMRequestManager {
     private void executeWithRetry(PriorityRequest priorityRequest) {
         String requestId = priorityRequest.requestId;
         Request request = priorityRequest.request;
+        long timeoutMs = priorityRequest.timeoutMs;
         RetryConfiguration retryConfig = priorityRequest.retryConfig;
         int currentAttempt = priorityRequest.currentAttempt;
         RequestCallback callback = priorityRequest.callback;
+
+        OkHttpClient callClient = client.newBuilder()
+                .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                .build();
 
         Call call = client.newCall(request);
         activeRequests.put(requestId, call);
@@ -213,6 +221,7 @@ public class TNMRequestManager {
                                 requestId,
                                 request,
                                 priorityRequest.priority + 0.1f, // Boost priority on retry
+                                priorityRequest.timeoutMs,
                                 retryConfig,
                                 currentAttempt + 1,
                                 callback
@@ -269,6 +278,7 @@ public class TNMRequestManager {
                                 requestId,
                                 request,
                                 priorityRequest.priority + 0.1f, // Boost priority on retry
+                                priorityRequest.timeoutMs,
                                 retryConfig,
                                 currentAttempt + 1,
                                 callback
@@ -331,17 +341,19 @@ public class TNMRequestManager {
         String requestId;
         Request request;
         float priority;
+        long timeoutMs;
         RetryConfiguration retryConfig;
         int currentAttempt;
         RequestCallback callback;
         long timestamp;
 
         PriorityRequest(String requestId, Request request, float priority,
-                        RetryConfiguration retryConfig, int currentAttempt,
+                        long timeoutMs, RetryConfiguration retryConfig, int currentAttempt,
                         RequestCallback callback) {
             this.requestId = requestId;
             this.request = request;
             this.priority = priority;
+            this.timeoutMs = timeoutMs;
             this.retryConfig = retryConfig;
             this.currentAttempt = currentAttempt;
             this.callback = callback;

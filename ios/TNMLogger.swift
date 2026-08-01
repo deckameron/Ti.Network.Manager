@@ -79,36 +79,55 @@ class TNMLogger {
     }
     
     // MARK: - Core Logging
-    
+
+    // ✅ Todas as chamadas de log passam por essa fila serial dedicada.
+    // TNMLogger.log() é chamado a partir de várias threads diferentes ao
+    // mesmo tempo: cada URLSession do pool (uma por host+timeout) roda seu
+    // completion handler na sua PRÓPRIA fila em background, então requisições
+    // simultâneas a domínios diferentes (ex.: API da Upflix + TMDB + IMDB)
+    // podiam legitimamente chamar log() em paralelo, de threads distintas.
+    // O bug: `dateFormatter` era um único DateFormatter estático compartilhado,
+    // e DateFormatter NÃO é thread-safe para chamadas concorrentes de
+    // string(from:) — é um bug clássico e bem documentado da Foundation/ICU
+    // que corrompe heap e se manifesta como crashes aparentemente
+    // aleatórios/não relacionados em outro lugar do app (exatamente o padrão
+    // observado: `-[X boundBridge:withKrollObject:]` batendo numa classe
+    // diferente a cada crash — sintoma clássico de memória corrompida, não
+    // de um objeto específico com problema). Serializar todo o corpo de
+    // log() nessa fila elimina a corrida.
+    private static let logQueue = DispatchQueue(label: "com.upflix.tinetworkmanager.logger")
+
     private static func log(level: Level, message: String, feature: String?, details: [String: Any]?) {
         guard isEnabled else { return }
-        
-        let timestamp = dateFormatter.string(from: Date())
-        let featureTag = feature != nil ? "[\(feature!)]" : ""
-        let levelColor = colorForLevel(level)
-        let featureColor = Color.cyan.rawValue
-        
-        // Format: [TIMESTAMP] [LEVEL] [FEATURE] Message
-        var logMessage = "\(Color.gray.rawValue)[\(timestamp)]\(Color.reset.rawValue) "
-        logMessage += "\(levelColor)[\(level.rawValue)]\(Color.reset.rawValue) "
-        
-        if !featureTag.isEmpty {
-            logMessage += "\(featureColor)\(featureTag)\(Color.reset.rawValue) "
-        }
-        
-        logMessage += message
-        
-        // Add details if present
-        if let details = details, !details.isEmpty {
-            logMessage += "\n"
-            for (key, value) in details.sorted(by: { $0.key < $1.key }) {
-                logMessage += "  \(Color.gray.rawValue)|\(Color.reset.rawValue) "
-                logMessage += "\(Color.brightBlue.rawValue)\(key):\(Color.reset.rawValue) \(value)"
-                logMessage += "\n"
+
+        logQueue.async {
+            let timestamp = dateFormatter.string(from: Date())
+            let featureTag = feature != nil ? "[\(feature!)]" : ""
+            let levelColor = colorForLevel(level)
+            let featureColor = Color.cyan.rawValue
+
+            // Format: [TIMESTAMP] [LEVEL] [FEATURE] Message
+            var logMessage = "\(Color.gray.rawValue)[\(timestamp)]\(Color.reset.rawValue) "
+            logMessage += "\(levelColor)[\(level.rawValue)]\(Color.reset.rawValue) "
+
+            if !featureTag.isEmpty {
+                logMessage += "\(featureColor)\(featureTag)\(Color.reset.rawValue) "
             }
+
+            logMessage += message
+
+            // Add details if present
+            if let details = details, !details.isEmpty {
+                logMessage += "\n"
+                for (key, value) in details.sorted(by: { $0.key < $1.key }) {
+                    logMessage += "  \(Color.gray.rawValue)|\(Color.reset.rawValue) "
+                    logMessage += "\(Color.brightBlue.rawValue)\(key):\(Color.reset.rawValue) \(value)"
+                    logMessage += "\n"
+                }
+            }
+
+            NSLog("%@", logMessage)
         }
-        
-        NSLog("%@", logMessage)
     }
     
     // MARK: - Helpers
