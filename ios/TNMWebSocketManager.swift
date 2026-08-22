@@ -18,9 +18,46 @@ class TNMWebSocketManager: NSObject {
     
     // MARK: - Properties
     
+    // Touched from two threads: the caller's thread (connect/send/close/ping) and the
+    // URLSession delegate queue, where the receiveMessage loop tears the connection
+    // down on failure. A Swift Dictionary is not thread-safe, so concurrent mutation
+    // corrupts its storage. Every access goes through stateLock.
     private var activeConnections: [String: URLSessionWebSocketTask] = [:]
     private var websocketDelegates: [String: WebSocketDelegate] = [:]
     private var sessions: [String: URLSession] = [:]
+    private let stateLock = NSLock()
+
+    // MARK: - Synchronized State Access
+
+    private func registerConnection(
+        task: URLSessionWebSocketTask,
+        delegate: WebSocketDelegate,
+        session: URLSession,
+        for connectionId: String
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeConnections[connectionId] = task
+        websocketDelegates[connectionId] = delegate
+        sessions[connectionId] = session
+    }
+
+    private func connection(for connectionId: String) -> URLSessionWebSocketTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeConnections[connectionId]
+    }
+
+    /// Drops every entry for the connection and hands back the session so the caller
+    /// can invalidate it *outside* the critical section.
+    @discardableResult
+    private func removeConnection(for connectionId: String) -> URLSession? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeConnections.removeValue(forKey: connectionId)
+        websocketDelegates.removeValue(forKey: connectionId)
+        return sessions.removeValue(forKey: connectionId)
+    }
     
     // MARK: - Public Methods
     
@@ -49,8 +86,6 @@ class TNMWebSocketManager: NSObject {
             onError: onError
         )
         
-        websocketDelegates[connectionId] = delegate
-        
         // Create request
         var request = URLRequest(url: url)
         
@@ -73,12 +108,12 @@ class TNMWebSocketManager: NSObject {
             delegateQueue: nil
         )
         
-        sessions[connectionId] = session
-        
         // Create WebSocket task
         let task = session.webSocketTask(with: request)
         
-        activeConnections[connectionId] = task
+        // Register everything in one critical section, before the receive loop starts:
+        // that loop runs on the delegate queue and tears these same entries down.
+        registerConnection(task: task, delegate: delegate, session: session, for: connectionId)
         
         TNMLogger.debug("WebSocket task created", feature: "WebSocket", details: [
             "connectionId": connectionId,
@@ -100,7 +135,7 @@ class TNMWebSocketManager: NSObject {
      * Send text message
      */
     func sendMessage(connectionId: String, message: String, completion: @escaping (Error?) -> Void) {
-        guard let task = activeConnections[connectionId] else {
+        guard let task = connection(for: connectionId) else {
             let error = NSError(
                 domain: "TNMWebSocketManager",
                 code: -1,
@@ -130,7 +165,7 @@ class TNMWebSocketManager: NSObject {
      * Send binary data
      */
     func sendBinary(connectionId: String, data: Data, completion: @escaping (Error?) -> Void) {
-        guard let task = activeConnections[connectionId] else {
+        guard let task = connection(for: connectionId) else {
             let error = NSError(
                 domain: "TNMWebSocketManager",
                 code: -1,
@@ -159,7 +194,7 @@ class TNMWebSocketManager: NSObject {
      * Close WebSocket connection
      */
     func close(connectionId: String, code: URLSessionWebSocketTask.CloseCode = .normalClosure, reason: String? = nil) {
-        guard let task = activeConnections[connectionId] else {
+        guard let task = connection(for: connectionId) else {
             TNMLogger.debug("WebSocket already closed or not found", feature: "WebSocket", details: [
                 "connectionId": connectionId
             ])
@@ -171,17 +206,14 @@ class TNMWebSocketManager: NSObject {
         
         TNMLogger.WebSocket.closed(code: code.rawValue, reason: reason ?? "No reason")
         
-        activeConnections.removeValue(forKey: connectionId)
-        websocketDelegates.removeValue(forKey: connectionId)
-        sessions[connectionId]?.invalidateAndCancel()
-        sessions.removeValue(forKey: connectionId)
+        removeConnection(for: connectionId)?.invalidateAndCancel()
     }
     
     /**
      * Ping server
      */
     func ping(connectionId: String, completion: @escaping (Error?) -> Void) {
-        guard let task = activeConnections[connectionId] else {
+        guard let task = connection(for: connectionId) else {
             let error = NSError(
                 domain: "TNMWebSocketManager",
                 code: -1,
@@ -238,10 +270,7 @@ class TNMWebSocketManager: NSObject {
                 TNMLogger.WebSocket.error(error: error)
                 delegate.onError(error)
                 
-                self.activeConnections.removeValue(forKey: connectionId)
-                self.websocketDelegates.removeValue(forKey: connectionId)
-                self.sessions[connectionId]?.invalidateAndCancel()
-                self.sessions.removeValue(forKey: connectionId)
+                self.removeConnection(for: connectionId)?.invalidateAndCancel()
             }
         }
     }

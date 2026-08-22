@@ -18,10 +18,72 @@ class TNMBackgroundTransferManager: NSObject {
     
     // MARK: - Properties
     
+    // This class is itself the URLSession delegate, so the four dictionaries below are
+    // read and mutated from two threads: the caller's thread (start/cancel/resume) and
+    // the session's delegate queue (didFinishDownloadingTo, didCompleteWithError, and
+    // findDelegateForTask, which *iterates* them). A Swift Dictionary is not
+    // thread-safe, and enumerating one while another thread mutates it corrupts the
+    // storage. Every access goes through stateLock.
     private var activeDownloads: [String: URLSessionDownloadTask] = [:]
     private var activeUploads: [String: URLSessionUploadTask] = [:]
     private var downloadDelegates: [String: BackgroundDownloadDelegate] = [:]
     private var uploadDelegates: [String: BackgroundUploadDelegate] = [:]
+    private let stateLock = NSLock()
+
+    // MARK: - Synchronized State Access
+
+    private func setDownload(_ task: URLSessionDownloadTask, delegate: BackgroundDownloadDelegate?, for transferId: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeDownloads[transferId] = task
+        if let delegate = delegate {
+            downloadDelegates[transferId] = delegate
+        }
+    }
+
+    private func setUpload(_ task: URLSessionUploadTask, delegate: BackgroundUploadDelegate?, for transferId: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeUploads[transferId] = task
+        if let delegate = delegate {
+            uploadDelegates[transferId] = delegate
+        }
+    }
+
+    private func downloadTask(for transferId: String) -> URLSessionDownloadTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeDownloads[transferId]
+    }
+
+    @discardableResult
+    private func removeDownload(for transferId: String) -> URLSessionDownloadTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        downloadDelegates.removeValue(forKey: transferId)
+        return activeDownloads.removeValue(forKey: transferId)
+    }
+
+    @discardableResult
+    private func removeUpload(for transferId: String) -> URLSessionUploadTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        uploadDelegates.removeValue(forKey: transferId)
+        return activeUploads.removeValue(forKey: transferId)
+    }
+
+    /// Snapshots taken under the lock so the caller enumerates its own copy.
+    private func downloadSnapshot() -> ([String: BackgroundDownloadDelegate], [String: URLSessionDownloadTask]) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (downloadDelegates, activeDownloads)
+    }
+
+    private func uploadSnapshot() -> ([String: BackgroundUploadDelegate], [String: URLSessionUploadTask]) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (uploadDelegates, activeUploads)
+    }
     private var backgroundSession: URLSession!
     
     // MARK: - Initialization
@@ -76,8 +138,6 @@ class TNMBackgroundTransferManager: NSObject {
             certificateValidator: certificateValidator
         )
         
-        downloadDelegates[transferId] = delegate
-        
         // Create request
         var request = URLRequest(url: url)
         
@@ -90,7 +150,9 @@ class TNMBackgroundTransferManager: NSObject {
         
         // Create download task
         let task = backgroundSession.downloadTask(with: request)
-        activeDownloads[transferId] = task
+        // Register task and delegate in one critical section, before resume(), so the
+        // delegate queue never observes a task without its delegate.
+        setDownload(task, delegate: delegate, for: transferId)
         
         TNMLogger.debug("Download task created", feature: "BackgroundTransfer", details: [
             "transferId": transferId,
@@ -109,16 +171,15 @@ class TNMBackgroundTransferManager: NSObject {
             "transferId": transferId
         ])
         
-        activeDownloads[transferId]?.cancel()
-        activeDownloads.removeValue(forKey: transferId)
-        downloadDelegates.removeValue(forKey: transferId)
+        // Remove first, then cancel: never hold stateLock while calling into URLSession.
+        removeDownload(for: transferId)?.cancel()
     }
     
     /**
      * Pause download
      */
     func pauseDownload(transferId: String, completion: @escaping (Data?) -> Void) {
-        guard let task = activeDownloads[transferId] else {
+        guard let task = downloadTask(for: transferId) else {
             completion(nil)
             return
         }
@@ -142,7 +203,7 @@ class TNMBackgroundTransferManager: NSObject {
         ])
         
         let task = backgroundSession.downloadTask(withResumeData: resumeData)
-        activeDownloads[transferId] = task
+        setDownload(task, delegate: nil, for: transferId)
         task.resume()
     }
     
@@ -176,8 +237,6 @@ class TNMBackgroundTransferManager: NSObject {
             certificateValidator: certificateValidator
         )
         
-        uploadDelegates[transferId] = delegate
-        
         // Create request
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -191,7 +250,7 @@ class TNMBackgroundTransferManager: NSObject {
         
         // Create upload task
         let task = backgroundSession.uploadTask(with: request, fromFile: fileURL)
-        activeUploads[transferId] = task
+        setUpload(task, delegate: delegate, for: transferId)
         
         TNMLogger.debug("Upload task created", feature: "BackgroundTransfer", details: [
             "transferId": transferId,
@@ -210,16 +269,15 @@ class TNMBackgroundTransferManager: NSObject {
             "transferId": transferId
         ])
         
-        activeUploads[transferId]?.cancel()
-        activeUploads.removeValue(forKey: transferId)
-        uploadDelegates.removeValue(forKey: transferId)
+        removeUpload(for: transferId)?.cancel()
     }
     
     // MARK: - Helper Methods
     
     private func findDelegateForTask(_ task: URLSessionTask) -> (String, BackgroundDownloadDelegate)? {
-        for (transferId, delegate) in downloadDelegates {
-            if activeDownloads[transferId]?.taskIdentifier == task.taskIdentifier {
+        let (delegates, tasks) = downloadSnapshot()
+        for (transferId, delegate) in delegates {
+            if tasks[transferId]?.taskIdentifier == task.taskIdentifier {
                 return (transferId, delegate)
             }
         }
@@ -227,8 +285,9 @@ class TNMBackgroundTransferManager: NSObject {
     }
     
     private func findUploadDelegateForTask(_ task: URLSessionTask) -> (String, BackgroundUploadDelegate)? {
-        for (transferId, delegate) in uploadDelegates {
-            if activeUploads[transferId]?.taskIdentifier == task.taskIdentifier {
+        let (delegates, tasks) = uploadSnapshot()
+        for (transferId, delegate) in delegates {
+            if tasks[transferId]?.taskIdentifier == task.taskIdentifier {
                 return (transferId, delegate)
             }
         }
@@ -289,8 +348,7 @@ extension TNMBackgroundTransferManager: URLSessionDownloadDelegate {
             delegate.onComplete(destinationURL.path)
             
             // Cleanup
-            activeDownloads.removeValue(forKey: transferId)
-            downloadDelegates.removeValue(forKey: transferId)
+            removeDownload(for: transferId)
             
         } catch {
             TNMLogger.error("Failed to move downloaded file", feature: "BackgroundTransfer", error: error, details: [
@@ -336,8 +394,7 @@ extension TNMBackgroundTransferManager: URLSessionTaskDelegate {
                 ])
                 delegate.onError(error)
                 
-                activeDownloads.removeValue(forKey: transferId)
-                downloadDelegates.removeValue(forKey: transferId)
+                removeDownload(for: transferId)
             }
             // Handle upload error
             else if let (transferId, delegate) = findUploadDelegateForTask(task) {
@@ -346,8 +403,7 @@ extension TNMBackgroundTransferManager: URLSessionTaskDelegate {
                 ])
                 delegate.onError(error)
                 
-                activeUploads.removeValue(forKey: transferId)
-                uploadDelegates.removeValue(forKey: transferId)
+                removeUpload(for: transferId)
             }
         }
     }

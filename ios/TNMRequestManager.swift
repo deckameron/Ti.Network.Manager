@@ -18,8 +18,14 @@ class TNMRequestManager {
     
     // MARK: - Properties
     
+    // activeTasks/retryState are touched from three threads: the caller's thread
+    // (registration), the URLSession delegate queue (completion handler) and whatever
+    // thread calls cancelRequest. A Swift Dictionary is not thread-safe -- concurrent
+    // mutation corrupts its storage and the process later crashes while releasing the
+    // stale buffer, deep inside the task teardown. Everything goes through stateLock.
     private var activeTasks: [String: URLSessionDataTask] = [:]
     private var retryState: [String: RetryState] = [:]
+    private let stateLock = NSLock()
     
     // Session pool: keyed by "host_timeout" to reuse TCP/TLS connections
     // across requests to the same host with the same timeout setting.
@@ -28,6 +34,33 @@ class TNMRequestManager {
     private var delegatePool: [String: SessionDelegate] = [:]
     private let sessionPoolLock = NSLock()
     
+    // MARK: - Synchronized State Access
+
+    private func setActiveTask(_ task: URLSessionDataTask, for requestId: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeTasks[requestId] = task
+    }
+
+    private func activeTask(for requestId: String) -> URLSessionDataTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeTasks[requestId]
+    }
+
+    @discardableResult
+    private func removeActiveTask(for requestId: String) -> URLSessionDataTask? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeTasks.removeValue(forKey: requestId)
+    }
+
+    private func removeRetryState(for requestId: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        retryState.removeValue(forKey: requestId)
+    }
+
     // MARK: - Public Methods
     
     /**
@@ -83,7 +116,9 @@ class TNMRequestManager {
     func cancelRequest(requestId: String) {
         TNMLogger.Request.cancelled(requestId: requestId)
         
-        if let task = activeTasks[requestId] {
+        // Remove first, then cancel: never hold stateLock while calling out into
+        // URLSession or the delegate pool.
+        if let task = removeActiveTask(for: requestId) {
             // Unregister progress handler from the shared session delegate
             // before cancelling, so no stale callbacks fire.
             sessionPoolLock.lock()
@@ -93,10 +128,9 @@ class TNMRequestManager {
             sessionPoolLock.unlock()
             
             task.cancel()
-            activeTasks.removeValue(forKey: requestId)
         }
         
-        retryState.removeValue(forKey: requestId)
+        removeRetryState(for: requestId)
     }
     
     // MARK: - Session Pool
@@ -187,7 +221,7 @@ class TNMRequestManager {
             guard let self = self else { return }
             
             // Unregister progress handler now that the task is done
-            sessionDelegate.unregister(taskIdentifier: (self.activeTasks[requestId]?.taskIdentifier ?? -1))
+            sessionDelegate.unregister(taskIdentifier: (self.activeTask(for: requestId)?.taskIdentifier ?? -1))
             
             if let error = error {
                 let errorCopy = NSError(
@@ -195,30 +229,30 @@ class TNMRequestManager {
                     code: (error as NSError).code,
                     userInfo: (error as NSError).userInfo
                 )
-                
-                let willRetryAgain = currentAttemptCounter + 1 < (retryConfig?.maxRetries ?? 0)
-                currentAttemptCounter = currentAttemptCounter + 1
-                
+
+                let willActuallyRetry = retryConfig != nil
+                    && attempt < retryConfig!.maxRetries
+                    && self.shouldRetry(error: errorCopy, retryConfig: retryConfig!)
+
                 DispatchQueue.main.async {
-                    onError(errorCopy, willRetryAgain)
+                    onError(errorCopy, willActuallyRetry)
                 }
-                
-                if let retryConfig = retryConfig,
-                   attempt < retryConfig.maxRetries,
-                   self.shouldRetry(error: errorCopy, retryConfig: retryConfig) {
-                    
+
+                if willActuallyRetry {
+                    currentAttemptCounter = currentAttemptCounter + 1
+
                     let delay = self.calculateRetryDelay(
                         attempt: attempt,
-                        backoffType: retryConfig.backoffType,
-                        baseDelay: retryConfig.baseDelay
+                        backoffType: retryConfig!.backoffType,
+                        baseDelay: retryConfig!.baseDelay
                     )
-                    
+
                     TNMLogger.Retry.attempting(
                         attempt: attempt + 1,
-                        maxAttempts: retryConfig.maxRetries,
+                        maxAttempts: retryConfig!.maxRetries,
                         delay: delay
                     )
-                    
+
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                         self.executeWithRetry(
                             currentAttempt: currentAttemptCounter,
@@ -242,10 +276,10 @@ class TNMRequestManager {
                     if let retryConfig = retryConfig, attempt >= retryConfig.maxRetries {
                         TNMLogger.Retry.exhausted(attempts: attempt)
                     }
-                    
-                    self.activeTasks.removeValue(forKey: requestId)
-                    self.retryState.removeValue(forKey: requestId)
-                    
+
+                    self.removeActiveTask(for: requestId)
+                    self.removeRetryState(for: requestId)
+
                     TNMLogger.Request.error(requestId: requestId, error: errorCopy)
                 }
                 return
@@ -257,7 +291,7 @@ class TNMRequestManager {
                     code: -1,
                     userInfo: [NSLocalizedDescriptionKey: "Invalid response"]
                 )
-                self.activeTasks.removeValue(forKey: requestId)
+                self.removeActiveTask(for: requestId)
                 
                 TNMLogger.Request.error(requestId: requestId, error: error)
                 
@@ -334,8 +368,8 @@ class TNMRequestManager {
                 dataCopy = nil
             }
             
-            self.activeTasks.removeValue(forKey: requestId)
-            self.retryState.removeValue(forKey: requestId)
+            self.removeActiveTask(for: requestId)
+            self.removeRetryState(for: requestId)
             
             let duration = Date().timeIntervalSince(startTime)
             TNMLogger.Request.completed(
@@ -359,7 +393,7 @@ class TNMRequestManager {
         }
         
         task.priority = priority
-        activeTasks[requestId] = task
+        setActiveTask(task, for: requestId)
         task.resume()
     }
     

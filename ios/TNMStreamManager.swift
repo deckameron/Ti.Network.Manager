@@ -21,7 +21,51 @@ class TNMStreamManager: NSObject {
     private var activeSessions: [String: URLSession] = [:]
     private var activeDataTasks: [String: URLSessionDataTask] = [:]
     private var streamDelegates: [String: StreamDelegate] = [:]
-    
+
+    // Cleanup on completion arrives on the URLSession delegate queue while
+    // startStream/cancelStream run on the caller's thread, so every access to the three
+    // dictionaries above goes through stateLock. A Swift Dictionary is not thread-safe.
+    private let stateLock = NSLock()
+
+    // MARK: - Synchronized State Access
+
+    private func registerStream(
+        task: URLSessionDataTask,
+        delegate: StreamDelegate,
+        session: URLSession,
+        for requestId: String
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeDataTasks[requestId] = task
+        streamDelegates[requestId] = delegate
+        activeSessions[requestId] = session
+    }
+
+    /// Drops every entry for the stream and hands the task and session back so the
+    /// caller can cancel/invalidate them *outside* the critical section.
+    private func removeStream(for requestId: String) -> (URLSessionDataTask?, URLSession?) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        streamDelegates.removeValue(forKey: requestId)
+        return (activeDataTasks.removeValue(forKey: requestId), activeSessions.removeValue(forKey: requestId))
+    }
+
+    private func activeStreamIds() -> [String] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Array(activeSessions.keys)
+    }
+
+    /// Called from the delegate once the task reached a terminal state. Without this the
+    /// three entries lived forever and, because a URLSession retains its delegate until
+    /// it is invalidated, every finished stream leaked its session, its delegate and all
+    /// the callbacks the delegate captured.
+    private func finishStream(requestId: String) {
+        let (_, session) = removeStream(for: requestId)
+        session?.finishTasksAndInvalidate()
+    }
+
     // MARK: - Public Methods
     
     /**
@@ -50,8 +94,10 @@ class TNMStreamManager: NSObject {
             certificateValidator: certificateValidator
         )
         
-        // Store delegate
-        streamDelegates[requestId] = delegate
+        // Weak self: the manager owns the delegate, so a strong capture would be a cycle.
+        delegate.onFinished = { [weak self] finishedId in
+            self?.finishStream(requestId: finishedId)
+        }
         
         // Create session configuration
         let config = URLSessionConfiguration.default
@@ -73,8 +119,6 @@ class TNMStreamManager: NSObject {
             delegateQueue: nil
         )
         
-        activeSessions[requestId] = session
-        
         // Create request
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -88,7 +132,9 @@ class TNMStreamManager: NSObject {
         let task = session.dataTask(with: request)
         task.priority = priority
         
-        activeDataTasks[requestId] = task
+        // Register in one critical section, before resume(), so the delegate queue never
+        // observes a half-registered stream.
+        registerStream(task: task, delegate: delegate, session: session, for: requestId)
         
         TNMLogger.debug("Stream task created", feature: "Streaming", details: [
             "requestId": requestId,
@@ -107,12 +153,10 @@ class TNMStreamManager: NSObject {
             "requestId": requestId
         ])
         
-        activeDataTasks[requestId]?.cancel()
-        activeSessions[requestId]?.invalidateAndCancel()
-        
-        activeDataTasks.removeValue(forKey: requestId)
-        activeSessions.removeValue(forKey: requestId)
-        streamDelegates.removeValue(forKey: requestId)
+        // Remove first, then call out: never hold stateLock while touching URLSession.
+        let (task, session) = removeStream(for: requestId)
+        task?.cancel()
+        session?.invalidateAndCancel()
     }
     
     /**
@@ -120,10 +164,10 @@ class TNMStreamManager: NSObject {
      */
     func cancelAllStreams() {
         TNMLogger.info("Cancelling all streams", feature: "Streaming", details: [
-            "activeStreams": activeSessions.count
+            "activeStreams": activeStreamIds().count
         ])
         
-        for (requestId, _) in activeSessions {
+        for requestId in activeStreamIds() {
             cancelStream(requestId: requestId)
         }
     }
@@ -150,6 +194,10 @@ class StreamDelegate: NSObject, URLSessionDataDelegate {
     private let onComplete: (Int, [String: String]) -> Void
     private let onError: (Error) -> Void
     private let certificateValidator: CertificateValidator?
+    
+    /// Set by the manager so it can drop its bookkeeping and invalidate the session
+    /// once the task reaches a terminal state.
+    var onFinished: ((String) -> Void)?
     
     private var buffer = Data()
     private var statusCode: Int = 0
@@ -223,6 +271,9 @@ class StreamDelegate: NSObject, URLSessionDataDelegate {
                 TNMLogger.debug("Stream was cancelled", feature: "Streaming", details: [
                     "requestId": requestId
                 ])
+                // cancelStream() already cleaned up, but a cancel can also come from
+                // elsewhere (backgrounding, system teardown); the cleanup is idempotent.
+                onFinished?(requestId)
                 return
             }
             
@@ -242,6 +293,8 @@ class StreamDelegate: NSObject, URLSessionDataDelegate {
             
             onComplete(statusCode, responseHeaders)
         }
+        
+        onFinished?(requestId)
     }
     
     // MARK: - Certificate Pinning

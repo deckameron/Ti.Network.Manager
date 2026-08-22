@@ -21,7 +21,45 @@ class TNMMultipartUploadManager {
     private var activeUploads: [String: URLSessionUploadTask] = [:]
     private var uploadDelegates: [String: MultipartUploadDelegate] = [:]
     private var sessions: [String: URLSession] = [:]
-    
+
+    // Cleanup on completion arrives on the URLSession delegate queue while
+    // startUpload/cancelUpload run on the caller's thread, so every access to the three
+    // dictionaries above goes through stateLock. A Swift Dictionary is not thread-safe.
+    private let stateLock = NSLock()
+
+    // MARK: - Synchronized State Access
+
+    private func registerUpload(
+        task: URLSessionUploadTask,
+        delegate: MultipartUploadDelegate,
+        session: URLSession,
+        for uploadId: String
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        activeUploads[uploadId] = task
+        uploadDelegates[uploadId] = delegate
+        sessions[uploadId] = session
+    }
+
+    /// Drops every entry for the upload and hands the task and session back so the
+    /// caller can cancel/invalidate them *outside* the critical section.
+    private func removeUpload(for uploadId: String) -> (URLSessionUploadTask?, URLSession?) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        uploadDelegates.removeValue(forKey: uploadId)
+        return (activeUploads.removeValue(forKey: uploadId), sessions.removeValue(forKey: uploadId))
+    }
+
+    /// Called from the delegate once the task reached a terminal state. Without this the
+    /// three entries lived forever and, because a URLSession retains its delegate until
+    /// it is invalidated, every finished upload leaked its session, its delegate and all
+    /// the callbacks the delegate captured.
+    private func finishUpload(uploadId: String) {
+        let (_, session) = removeUpload(for: uploadId)
+        session?.finishTasksAndInvalidate()
+    }
+
     // MARK: - Public Methods
     
     /**
@@ -82,7 +120,10 @@ class TNMMultipartUploadManager {
             certificateValidator: certificateValidator
         )
         
-        uploadDelegates[uploadId] = delegate
+        // Weak self: the manager owns the delegate, so a strong capture would be a cycle.
+        delegate.onFinished = { [weak self] finishedId in
+            self?.finishUpload(uploadId: finishedId)
+        }
         
         // Create session
         let config = URLSessionConfiguration.default
@@ -93,8 +134,6 @@ class TNMMultipartUploadManager {
             delegate: delegate,
             delegateQueue: nil
         )
-        
-        sessions[uploadId] = session
         
         // Create request
         var request = URLRequest(url: url)
@@ -112,7 +151,9 @@ class TNMMultipartUploadManager {
         let task = session.uploadTask(with: request, from: multipartData)
         task.priority = priority
         
-        activeUploads[uploadId] = task
+        // Register in one critical section, before resume(), so the delegate queue never
+        // observes a half-registered upload.
+        registerUpload(task: task, delegate: delegate, session: session, for: uploadId)
         
         TNMLogger.debug("Upload task created", feature: "MultipartUpload", details: [
             "uploadId": uploadId,
@@ -132,11 +173,10 @@ class TNMMultipartUploadManager {
             "uploadId": uploadId
         ])
         
-        activeUploads[uploadId]?.cancel()
-        activeUploads.removeValue(forKey: uploadId)
-        uploadDelegates.removeValue(forKey: uploadId)
-        sessions[uploadId]?.invalidateAndCancel()
-        sessions.removeValue(forKey: uploadId)
+        // Remove first, then call out: never hold stateLock while touching URLSession.
+        let (task, session) = removeUpload(for: uploadId)
+        task?.cancel()
+        session?.invalidateAndCancel()
     }
     
     // MARK: - Helpers
@@ -231,6 +271,10 @@ class MultipartUploadDelegate: NSObject, URLSessionTaskDelegate, URLSessionDataD
     let onComplete: (Int, [String: String], Data?) -> Void
     let onError: (Error) -> Void
     let certificateValidator: CertificateValidator?
+    
+    /// Set by the manager so it can drop its bookkeeping and invalidate the session
+    /// once the task reaches a terminal state.
+    var onFinished: ((String) -> Void)?
     
     private var responseData = Data()
     private var currentFileIndex = 0
@@ -332,6 +376,7 @@ class MultipartUploadDelegate: NSObject, URLSessionTaskDelegate, URLSessionDataD
                 "uploadId": uploadId
             ])
             onError(error)
+            onFinished?(uploadId)
             return
         }
         
@@ -345,6 +390,7 @@ class MultipartUploadDelegate: NSObject, URLSessionTaskDelegate, URLSessionDataD
                 "uploadId": uploadId
             ])
             onError(error)
+            onFinished?(uploadId)
             return
         }
         
@@ -364,6 +410,7 @@ class MultipartUploadDelegate: NSObject, URLSessionTaskDelegate, URLSessionDataD
         ])
         
         onComplete(statusCode, headers, responseData)
+        onFinished?(uploadId)
     }
     
     // MARK: - URLSessionDataDelegate
